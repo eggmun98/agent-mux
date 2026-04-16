@@ -32,7 +32,40 @@
   - Claude Code CLI: `claude`
   - Gemini CLI: `gemini`
 
-## 설치 (로컬)
+## 설치 및 업데이트
+
+전역 설치:
+
+```bash
+npm install -g @eggmun/agent-mux@latest
+```
+
+특정 버전 설치:
+
+```bash
+npm install -g @eggmun/agent-mux@0.1.2
+```
+
+업데이트:
+
+```bash
+npm install -g @eggmun/agent-mux@latest
+```
+
+확인:
+
+```bash
+amux --version
+amux --help
+```
+
+`npx`로 바로 실행할 수도 있습니다.
+
+```bash
+npx @eggmun/agent-mux@latest --version
+```
+
+## 개발용 로컬 설치
 
 ```bash
 npm install
@@ -85,7 +118,6 @@ Terminal 1 (계정 A):
 ```bash
 amux use a
 amux login
-amux claude login
 amux codex run
 amux run a
 ```
@@ -95,8 +127,27 @@ Terminal 2 (계정 B):
 ```bash
 amux use b
 amux login claude
-amux claude login
 amux claude run
+```
+
+프로필 이름을 기억하지 않아도 됩니다.
+
+```bash
+amux use
+```
+
+provider 이름을 기억하지 않아도 됩니다.
+
+```bash
+amux login
+```
+
+provider를 바로 지정하면 선택 목록 없이 실행됩니다.
+
+```bash
+amux login codex
+amux login claude
+amux login gemini
 ```
 
 상태 확인:
