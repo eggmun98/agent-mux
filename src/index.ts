@@ -3,8 +3,10 @@
 import { Command, Option } from 'commander';
 import { execa } from 'execa';
 import fs from 'node:fs';
+import * as http from 'node:http';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { createInterface } from 'node:readline/promises';
 import which from 'which';
 
 type ProviderId = string;
@@ -39,6 +41,13 @@ type ProviderStatus = {
   accountId?: string;
   authMethod?: string;
   message?: string;
+};
+
+type LocalCallbackForwardResult = {
+  statusCode: number;
+  statusMessage: string;
+  finalUrl: string;
+  redirects: string[];
 };
 
 type ProviderDefinition = {
@@ -445,6 +454,131 @@ async function runProviderWithProfile(
   }
 }
 
+function isLocalCallbackHost(hostname: string): boolean {
+  const normalized = hostname.toLowerCase();
+  return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1' || normalized === '[::1]';
+}
+
+function parseLocalCallbackUrl(rawUrl: string): URL {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) {
+    throw new Error('Redirect URL cannot be empty.');
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error('Redirect URL must be a valid URL.');
+  }
+
+  if (parsed.protocol !== 'http:') {
+    throw new Error('Only http:// localhost redirect URLs are allowed.');
+  }
+
+  if (!isLocalCallbackHost(parsed.hostname)) {
+    throw new Error('Only localhost, 127.0.0.1, or ::1 redirect URLs are allowed.');
+  }
+
+  if (!parsed.port) {
+    throw new Error('Redirect URL must include the Codex local callback port.');
+  }
+
+  return parsed;
+}
+
+function redactedLocalUrl(url: URL): string {
+  return `${url.protocol}//${url.host}${url.pathname}`;
+}
+
+async function readAllStdin(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk: string) => {
+      data += chunk;
+    });
+    process.stdin.on('end', () => {
+      resolve(data);
+    });
+    process.stdin.on('error', reject);
+  });
+}
+
+async function readCallbackUrl(urlArg?: string): Promise<string> {
+  if (urlArg?.trim()) {
+    return urlArg.trim();
+  }
+
+  if (process.stdin.isTTY) {
+    const readline = createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+
+    try {
+      return (await readline.question('Paste localhost redirect URL: ')).trim();
+    } finally {
+      readline.close();
+    }
+  }
+
+  return (await readAllStdin()).trim();
+}
+
+async function requestLocalCallback(url: URL): Promise<{
+  statusCode: number;
+  statusMessage: string;
+  location?: string;
+}> {
+  return new Promise((resolve, reject) => {
+    const request = http.request(url, { method: 'GET' }, (response) => {
+      response.resume();
+      response.on('end', () => {
+        const rawLocation = response.headers.location;
+        const location = Array.isArray(rawLocation) ? rawLocation[0] : rawLocation;
+        resolve({
+          statusCode: response.statusCode ?? 0,
+          statusMessage: response.statusMessage ?? '',
+          location
+        });
+      });
+    });
+
+    request.setTimeout(10_000, () => {
+      request.destroy(new Error('Timed out while forwarding redirect URL to the local callback server.'));
+    });
+    request.on('error', reject);
+    request.end();
+  });
+}
+
+async function forwardLocalCallback(rawUrl: string): Promise<LocalCallbackForwardResult> {
+  let currentUrl = parseLocalCallbackUrl(rawUrl);
+  const redirects: string[] = [];
+
+  for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
+    const response = await requestLocalCallback(currentUrl);
+    const shouldFollow =
+      response.statusCode >= 300 && response.statusCode < 400 && Boolean(response.location) && redirectCount < 5;
+
+    if (!shouldFollow) {
+      return {
+        statusCode: response.statusCode,
+        statusMessage: response.statusMessage,
+        finalUrl: redactedLocalUrl(currentUrl),
+        redirects
+      };
+    }
+
+    const nextUrl = parseLocalCallbackUrl(new URL(response.location as string, currentUrl).toString());
+    redirects.push(redactedLocalUrl(nextUrl));
+    currentUrl = nextUrl;
+  }
+
+  throw new Error('Too many redirects while forwarding the local callback URL.');
+}
+
 function codexStatusFromAuthFile(codexHome: string): ProviderStatus {
   const authFile = path.join(codexHome, 'auth.json');
   const available = findExecutable('codex') !== null;
@@ -664,6 +798,60 @@ function registerProviderCommands(
         process.exitCode = 1;
       }
     });
+
+  if (provider.id === 'codex') {
+    cmd
+      .command('login-device')
+      .description('run codex login with device-code auth for remote/headless machines')
+      .allowUnknownOption(true)
+      .addOption(commonProfileOption)
+      .addOption(commonVerboseOption)
+      .argument('[providerArgs...]', 'extra args forwarded to codex login --device-auth')
+      .action(async (providerArgs: string[], options: CommonOptions) => {
+        const state = readState();
+        const profile = resolveProfile(state, options);
+        writeState(state);
+
+        const exitCode = await runProviderWithProfile(
+          profile,
+          provider,
+          [...provider.loginArgs, '--device-auth', ...providerArgs],
+          options.verbose
+        );
+        process.exitCode = exitCode;
+      });
+
+    cmd
+      .command('callback')
+      .description('forward a pasted localhost OAuth redirect URL to the running Codex login server')
+      .argument('[url]', 'localhost redirect URL copied from the browser address bar')
+      .addOption(new Option('--json', 'output as JSON'))
+      .action(async (urlArg: string | undefined, options: CommonOptions) => {
+        const rawUrl = await readCallbackUrl(urlArg);
+        const result = await forwardLocalCallback(rawUrl);
+        const ok = result.statusCode >= 200 && result.statusCode < 400;
+
+        if (options.json) {
+          printJson({
+            ok,
+            statusCode: result.statusCode,
+            statusMessage: result.statusMessage,
+            finalUrl: result.finalUrl,
+            redirects: result.redirects
+          });
+        } else {
+          const statusText = result.statusMessage ? `${result.statusCode} ${result.statusMessage}` : result.statusCode;
+          console.log(`forwarded ${result.finalUrl} status=${statusText}`);
+          if (result.redirects.length > 0) {
+            console.log(`followed ${result.redirects.length} localhost redirect(s)`);
+          }
+        }
+
+        if (!ok) {
+          process.exitCode = 1;
+        }
+      });
+  }
 }
 
 async function main(): Promise<void> {

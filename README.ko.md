@@ -56,6 +56,10 @@ Provider 명령:
 - `amux codex login|logout|status|run [args...]`
 - `amux claude login|logout|status|run [args...]`
 
+Codex 원격 로그인 보조 명령:
+- `amux codex login-device` -> `codex login --device-auth`
+- `amux codex callback` -> 브라우저의 `http://localhost:<port>/...` redirect URL을 현재 머신의 Codex 로그인 서버로 전달
+
 기존 호환 별칭:
 - `amux login` -> `amux codex login`
 - `amux logout` -> `amux codex logout`
@@ -102,6 +106,35 @@ amux claude status
 amux는 OAuth/브라우저 인증 과정을 자동화하지 않습니다.
 
 `amux codex login`, `amux claude login` 실행 시 브라우저 인증과 터미널 확인은 사용자가 직접 수행하고, amux는 프로필별 저장 경로 분리만 담당합니다.
+
+## SSH/원격 Codex 로그인
+
+원격 서버, VM, EC2처럼 브라우저가 없는 환경에서는 우선 device-code 로그인을 사용합니다.
+
+```bash
+amux use a
+amux codex login-device
+```
+
+같은 동작을 직접 전달해도 됩니다.
+
+```bash
+amux codex login --device-auth
+```
+
+브라우저 로그인 URL을 반드시 써야 하는 경우에는 Codex 로그인 프로세스를 원격 터미널에 켜 둔 상태에서, 로컬 브라우저 주소창에 뜬 `http://localhost:<port>/...` redirect URL을 원격 터미널의 `amux codex callback`에 붙여넣을 수 있습니다.
+
+```bash
+# 원격 터미널 A
+amux codex login
+
+# 로컬 브라우저에서 인증 후 localhost redirect URL을 복사
+
+# 원격 터미널 B
+amux codex callback
+```
+
+redirect URL에는 일회성 인증 코드나 토큰이 들어갈 수 있습니다. 채팅, 이슈, 쉘 히스토리에 남기지 말고 가능하면 `amux codex callback` 프롬프트에 직접 붙여넣으세요.
 
 ## 저장 경로와 업데이트 안전성
 

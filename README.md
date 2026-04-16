@@ -56,6 +56,10 @@ Provider commands:
 - `amux codex login|logout|status|run [args...]`
 - `amux claude login|logout|status|run [args...]`
 
+Codex remote login helpers:
+- `amux codex login-device` -> `codex login --device-auth`
+- `amux codex callback` -> forward a browser `http://localhost:<port>/...` redirect URL to the Codex login server on this machine
+
 Legacy compatibility aliases:
 - `amux login` -> `amux codex login`
 - `amux logout` -> `amux codex logout`
@@ -102,6 +106,35 @@ amux claude status
 amux does not automate OAuth/browser flows.
 
 When running `amux codex login` or `amux claude login`, users complete browser sign-in and terminal confirmation directly. amux only isolates each profile's storage path.
+
+## SSH/Remote Codex Login
+
+On a remote server, VM, or EC2 instance without a local browser, prefer device-code login.
+
+```bash
+amux use a
+amux codex login-device
+```
+
+You can also pass the Codex option directly.
+
+```bash
+amux codex login --device-auth
+```
+
+If you must use the browser redirect flow, keep the Codex login process running on the remote terminal. After signing in locally, copy the browser address bar's `http://localhost:<port>/...` redirect URL and paste it into `amux codex callback` on the remote machine.
+
+```bash
+# Remote terminal A
+amux codex login
+
+# Authenticate in your local browser and copy the localhost redirect URL.
+
+# Remote terminal B
+amux codex callback
+```
+
+The redirect URL can contain a one-time code or token. Do not paste it into chats, issues, or shell history; prefer pasting it directly into the `amux codex callback` prompt.
 
 ## Storage and Update Safety
 
