@@ -7,6 +7,7 @@ Command: `amux`.
 Current built-in providers:
 - Codex CLI (`codex`)
 - Claude Code CLI (`claude`)
+- Gemini CLI (`gemini`)
 
 It lets you keep account A in terminal A and account B in terminal B, while isolating provider storage per profile.
 
@@ -29,6 +30,7 @@ It lets you keep account A in terminal A and account B in terminal B, while isol
 - Provider CLIs installed and available in PATH
   - Codex CLI: `codex`
   - Claude Code CLI: `claude`
+  - Gemini CLI: `gemini`
 
 ## Install (Local)
 
@@ -47,7 +49,7 @@ amux --help
 ## Command Model
 
 Common profile commands:
-- `amux use <profile>`
+- `amux use [profile]`
 - `amux current`
 - `amux list`
 - `amux providers`
@@ -55,20 +57,26 @@ Common profile commands:
 Provider commands:
 - `amux codex login|logout|status|run [args...]`
 - `amux claude login|logout|status|run [args...]`
+- `amux gemini login|logout|status|run [args...]`
 
 Codex remote login helpers:
 - `amux codex login-device` -> `codex login --device-auth`
 - `amux codex callback` -> forward a browser `http://localhost:<port>/...` redirect URL to the Codex login server on this machine
 
+Selection aliases:
+- `amux use` -> choose from registered profiles
+- `amux login` -> choose a provider, then run login
+- `amux login <provider>` -> run that provider login without a prompt
+
 Legacy compatibility aliases:
-- `amux login` -> `amux codex login`
 - `amux logout` -> `amux codex logout`
 - `amux run` -> `amux codex run`
 - `amux run <profile>` -> run Codex with that profile without `amux use`
 
-Run shortcuts (both providers):
+Run shortcuts:
 - `amux codex run <profile>`
 - `amux claude run <profile>`
+- `amux gemini run <profile>`
 
 ## Quick Start
 
@@ -76,7 +84,7 @@ Terminal 1 (account A):
 
 ```bash
 amux use a
-amux codex login
+amux login
 amux claude login
 amux codex run
 amux run a
@@ -86,7 +94,7 @@ Terminal 2 (account B):
 
 ```bash
 amux use b
-amux codex login
+amux login claude
 amux claude login
 amux claude run
 ```
@@ -99,13 +107,16 @@ amux list
 amux list --json
 amux codex status
 amux claude status
+amux gemini status
 ```
 
 ## Auth Flow Policy
 
 amux does not automate OAuth/browser flows.
 
-When running `amux codex login` or `amux claude login`, users complete browser sign-in and terminal confirmation directly. amux only isolates each profile's storage path.
+When running `amux login`, `amux codex login`, `amux claude login`, or `amux gemini login`, users complete browser sign-in and terminal confirmation directly. amux only isolates each profile's storage path.
+
+Gemini CLI does not expose a separate `login` CLI subcommand; it starts auth from the `gemini` app. `amux gemini login` and `amux login gemini` launch Gemini CLI with the selected profile's `GEMINI_CLI_HOME`.
 
 ## SSH/Remote Codex Login
 

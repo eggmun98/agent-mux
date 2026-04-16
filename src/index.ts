@@ -30,6 +30,7 @@ type MuxState = {
 
 type CommonOptions = {
   profile?: string;
+  provider?: string;
   verbose?: boolean;
   json?: boolean;
   global?: boolean;
@@ -300,6 +301,32 @@ function getProviderHomes(state: MuxState, profileName: string): Record<string, 
   return homes;
 }
 
+function providerLegacyHomeKey(provider: ProviderDefinition): string | undefined {
+  if (provider.id === 'codex') {
+    return 'codexHome';
+  }
+  if (provider.id === 'claude') {
+    return 'claudeConfigDir';
+  }
+  if (provider.id === 'gemini') {
+    return 'geminiCliHome';
+  }
+  return undefined;
+}
+
+function providerHomeLegacyFields(homes: Record<string, string>): Record<string, string> {
+  const result: Record<string, string> = {};
+
+  for (const provider of PROVIDERS) {
+    const legacyKey = providerLegacyHomeKey(provider);
+    if (legacyKey && homes[provider.id]) {
+      result[legacyKey] = homes[provider.id];
+    }
+  }
+
+  return result;
+}
+
 function getSessionKey(): string {
   const envSession =
     process.env.AMUX_SESSION ??
@@ -526,6 +553,81 @@ async function readCallbackUrl(urlArg?: string): Promise<string> {
   return (await readAllStdin()).trim();
 }
 
+type SelectionChoice<T> = {
+  id: string;
+  label: string;
+  value: T;
+  detail?: string;
+};
+
+function matchSelection<T>(input: string, choices: SelectionChoice<T>[]): T | undefined {
+  const answer = input.trim();
+  if (!answer) {
+    return undefined;
+  }
+
+  if (/^\d+$/.test(answer)) {
+    const index = Number.parseInt(answer, 10) - 1;
+    return choices[index]?.value;
+  }
+
+  const normalized = answer.toLowerCase();
+  return choices.find((choice) => {
+    return choice.id.toLowerCase() === normalized || choice.label.toLowerCase() === normalized;
+  })?.value;
+}
+
+async function readSelectionInput(prompt: string): Promise<string> {
+  if (!process.stdin.isTTY) {
+    const input = await readAllStdin();
+    const firstLine = input
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean);
+    return firstLine ?? '';
+  }
+
+  const readline = createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+
+  try {
+    return await readline.question(prompt);
+  } finally {
+    readline.close();
+  }
+}
+
+async function selectFromChoices<T>(
+  title: string,
+  choices: SelectionChoice<T>[],
+  options: { emptyInputValue?: T } = {}
+): Promise<T> {
+  if (choices.length === 0) {
+    throw new Error('No selectable entries are available.');
+  }
+
+  if (process.stdin.isTTY) {
+    for (const [index, choice] of choices.entries()) {
+      const detail = choice.detail ? ` - ${choice.detail}` : '';
+      console.log(`${index + 1}. ${choice.label}${detail}`);
+    }
+  }
+
+  const answer = await readSelectionInput(`${title}: `);
+  const matched = matchSelection(answer, choices);
+  if (matched !== undefined) {
+    return matched;
+  }
+
+  if (!answer.trim() && options.emptyInputValue !== undefined) {
+    return options.emptyInputValue;
+  }
+
+  throw new Error(`Invalid selection: ${answer || '(empty)'}`);
+}
+
 async function requestLocalCallback(url: URL): Promise<{
   statusCode: number;
   statusMessage: string;
@@ -657,6 +759,50 @@ async function claudeStatusFromCli(claudeConfigDir: string): Promise<ProviderSta
   }
 }
 
+async function geminiStatusFromHome(geminiHome: string): Promise<ProviderStatus> {
+  const available = findExecutable('gemini') !== null;
+  if (!available) {
+    return {
+      available: false,
+      message: '`gemini` not found'
+    };
+  }
+
+  const geminiDir = path.join(geminiHome, '.gemini');
+  const oauthFile = path.join(geminiDir, 'oauth_creds.json');
+  const accountsFile = path.join(geminiDir, 'google_accounts.json');
+
+  if (fs.existsSync(oauthFile)) {
+    return {
+      available: true,
+      loggedIn: true,
+      authMethod: 'oauth'
+    };
+  }
+
+  if (fs.existsSync(accountsFile)) {
+    return {
+      available: true,
+      loggedIn: true,
+      authMethod: 'google-account'
+    };
+  }
+
+  if (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY) {
+    return {
+      available: true,
+      loggedIn: true,
+      authMethod: 'api-key-env',
+      message: 'API key comes from the shell environment, not this profile home'
+    };
+  }
+
+  return {
+    available: true,
+    loggedIn: false
+  };
+}
+
 const PROVIDERS: ProviderDefinition[] = [
   {
     id: 'codex',
@@ -670,17 +816,130 @@ const PROVIDERS: ProviderDefinition[] = [
   },
   {
     id: 'claude',
-    label: 'Claude',
+    label: 'Claude Code',
     binary: 'claude',
     envKey: 'CLAUDE_CONFIG_DIR',
     homeDirName: 'claude-config',
     loginArgs: ['auth', 'login'],
     logoutArgs: ['auth', 'logout'],
     getStatus: claudeStatusFromCli
+  },
+  {
+    id: 'gemini',
+    label: 'Gemini CLI',
+    binary: 'gemini',
+    envKey: 'GEMINI_CLI_HOME',
+    homeDirName: 'gemini-home',
+    loginArgs: [],
+    logoutArgs: [],
+    getStatus: geminiStatusFromHome
   }
 ];
 
 const PROVIDER_BY_ID = new Map(PROVIDERS.map((provider) => [provider.id, provider]));
+
+function findProvider(input: string): ProviderDefinition | undefined {
+  const normalized = input.trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+
+  return PROVIDERS.find((provider) => {
+    return (
+      provider.id.toLowerCase() === normalized ||
+      provider.binary.toLowerCase() === normalized ||
+      provider.label.toLowerCase() === normalized
+    );
+  });
+}
+
+function providerSelectionChoices(): SelectionChoice<ProviderDefinition>[] {
+  return PROVIDERS.map((provider) => {
+    const available = findExecutable(provider.binary) !== null;
+    return {
+      id: provider.id,
+      label: `${provider.id} (${provider.label})`,
+      value: provider,
+      detail: available ? provider.binary : `${provider.binary} not found`
+    };
+  });
+}
+
+async function resolveProviderForInteractiveAlias(
+  options: CommonOptions,
+  rawArgs: string[],
+  emptyInputProvider: ProviderDefinition
+): Promise<{ provider: ProviderDefinition; providerArgs: string[] }> {
+  if (options.provider) {
+    const provider = findProvider(options.provider);
+    if (!provider) {
+      throw new Error(`Unknown provider: ${options.provider}`);
+    }
+    return { provider, providerArgs: rawArgs };
+  }
+
+  const firstArg = rawArgs[0];
+  if (firstArg && !firstArg.startsWith('-')) {
+    const provider = findProvider(firstArg);
+    if (provider) {
+      return {
+        provider,
+        providerArgs: rawArgs.slice(1)
+      };
+    }
+  }
+
+  if (firstArg?.startsWith('-')) {
+    return {
+      provider: emptyInputProvider,
+      providerArgs: rawArgs
+    };
+  }
+
+  const selected = await selectFromChoices('Select provider', providerSelectionChoices(), {
+    emptyInputValue: process.stdin.isTTY ? undefined : emptyInputProvider
+  });
+
+  return {
+    provider: selected,
+    providerArgs: rawArgs
+  };
+}
+
+function profileSelectionChoices(state: MuxState): SelectionChoice<string>[] {
+  const sessionKey = getSessionKey();
+  const names = Object.keys(state.profiles).sort();
+
+  return names.map((profileName) => {
+    const tags: string[] = [];
+    if (state.sessionProfiles[sessionKey] === profileName) {
+      tags.push('session');
+    }
+    if (state.globalProfile === profileName) {
+      tags.push('global');
+    }
+
+    return {
+      id: profileName,
+      label: profileName,
+      value: profileName,
+      detail: tags.length > 0 ? tags.join(',') : undefined
+    };
+  });
+}
+
+async function resolveUseProfile(state: MuxState, profileArg?: string): Promise<string> {
+  if (profileArg) {
+    return sanitizeProfile(profileArg);
+  }
+
+  const choices = profileSelectionChoices(state);
+  if (choices.length === 0) {
+    throw new Error('No profiles yet. Run `amux use <profile>` first.');
+  }
+
+  return selectFromChoices('Select profile', choices);
+}
 
 function statusToken(provider: ProviderDefinition, status: ProviderStatus): string {
   if (!status.available) {
@@ -858,12 +1117,13 @@ async function main(): Promise<void> {
   const program = new Command();
 
   const commonProfileOption = new Option('-p, --profile <name>', 'profile name');
+  const commonProviderOption = new Option('--provider <id>', 'provider id');
   const commonVerboseOption = new Option('--verbose', 'show debug details');
 
   program
     .name('amux')
     .description('amux: extensible multi-profile wrapper for AI agent CLIs')
-    .version('0.1.1');
+    .version('0.1.2');
 
   program
     .command('providers')
@@ -889,14 +1149,14 @@ async function main(): Promise<void> {
     });
 
   program
-    .command('use <profile>')
-    .description('set active profile for this terminal session (or globally)')
+    .command('use [profile]')
+    .description('set active profile for this terminal session (or choose one interactively)')
     .addOption(new Option('--global', 'set global default profile'))
     .addOption(new Option('--json', 'output as JSON'))
     .addOption(commonVerboseOption)
-    .action((profileArg: string, options: CommonOptions) => {
-      const profile = sanitizeProfile(profileArg);
+    .action(async (profileArg: string | undefined, options: CommonOptions) => {
       const state = readState();
+      const profile = await resolveUseProfile(state, profileArg);
       ensureProfile(state, profile);
 
       const sessionKey = getSessionKey();
@@ -916,8 +1176,7 @@ async function main(): Promise<void> {
           scope: options.global ? 'global' : 'session',
           sessionKey: options.global ? undefined : sessionKey,
           homes,
-          codexHome: homes.codex,
-          claudeConfigDir: homes.claude
+          ...providerHomeLegacyFields(homes)
         });
         return;
       }
@@ -952,8 +1211,7 @@ async function main(): Promise<void> {
         printJson({
           profile,
           homes,
-          codexHome: homes.codex,
-          claudeConfigDir: homes.claude,
+          ...providerHomeLegacyFields(homes),
           from: options.profile ? 'option' : state.sessionProfiles[sessionKey] ? 'session' : 'global',
           sessionKey
         });
@@ -1062,16 +1320,23 @@ async function main(): Promise<void> {
 
   program
     .command('login')
-    .description('[legacy] same as `amux codex login`')
+    .description('choose a provider and run login for the selected profile')
     .allowUnknownOption(true)
     .addOption(commonProfileOption)
+    .addOption(commonProviderOption)
     .addOption(commonVerboseOption)
-    .argument('[codexArgs...]', 'extra args forwarded to codex login')
-    .action(async (codexArgs: string[], options: CommonOptions) => {
+    .argument('[providerOrArgs...]', 'optional provider id + args forwarded to provider login')
+    .action(async (providerOrArgs: string[], options: CommonOptions) => {
+      const selected = await resolveProviderForInteractiveAlias(options, providerOrArgs, codexProvider);
       const state = readState();
       const profile = resolveProfile(state, options);
       writeState(state);
-      const exitCode = await runProviderWithProfile(profile, codexProvider, [...codexProvider.loginArgs, ...codexArgs], options.verbose);
+      const exitCode = await runProviderWithProfile(
+        profile,
+        selected.provider,
+        [...selected.provider.loginArgs, ...selected.providerArgs],
+        options.verbose
+      );
       process.exitCode = exitCode;
     });
 

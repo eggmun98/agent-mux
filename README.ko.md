@@ -7,6 +7,7 @@
 현재 내장 provider:
 - Codex CLI (`codex`)
 - Claude Code CLI (`claude`)
+- Gemini CLI (`gemini`)
 
 터미널 A는 계정 A, 터미널 B는 계정 B처럼 동시 사용하면서 provider별 저장 경로를 프로필로 격리할 수 있습니다.
 
@@ -29,6 +30,7 @@
 - provider CLI가 PATH에 설치되어 있어야 함
   - Codex CLI: `codex`
   - Claude Code CLI: `claude`
+  - Gemini CLI: `gemini`
 
 ## 설치 (로컬)
 
@@ -47,7 +49,7 @@ amux --help
 ## 명령 구조
 
 공통 프로필 명령:
-- `amux use <profile>`
+- `amux use [profile]`
 - `amux current`
 - `amux list`
 - `amux providers`
@@ -55,13 +57,18 @@ amux --help
 Provider 명령:
 - `amux codex login|logout|status|run [args...]`
 - `amux claude login|logout|status|run [args...]`
+- `amux gemini login|logout|status|run [args...]`
 
 Codex 원격 로그인 보조 명령:
 - `amux codex login-device` -> `codex login --device-auth`
 - `amux codex callback` -> 브라우저의 `http://localhost:<port>/...` redirect URL을 현재 머신의 Codex 로그인 서버로 전달
 
+선택형 별칭:
+- `amux use` -> 등록된 프로필 목록에서 선택
+- `amux login` -> provider 목록에서 선택 후 login
+- `amux login <provider>` -> 선택 프롬프트 없이 해당 provider login
+
 기존 호환 별칭:
-- `amux login` -> `amux codex login`
 - `amux logout` -> `amux codex logout`
 - `amux run` -> `amux codex run`
 - `amux run <profile>` -> `amux use` 없이 해당 프로필로 Codex 실행
@@ -69,6 +76,7 @@ Codex 원격 로그인 보조 명령:
 Provider 단축 실행:
 - `amux codex run <profile>`
 - `amux claude run <profile>`
+- `amux gemini run <profile>`
 
 ## Quick Start
 
@@ -76,7 +84,7 @@ Terminal 1 (계정 A):
 
 ```bash
 amux use a
-amux codex login
+amux login
 amux claude login
 amux codex run
 amux run a
@@ -86,7 +94,7 @@ Terminal 2 (계정 B):
 
 ```bash
 amux use b
-amux codex login
+amux login claude
 amux claude login
 amux claude run
 ```
@@ -99,13 +107,16 @@ amux list
 amux list --json
 amux codex status
 amux claude status
+amux gemini status
 ```
 
 ## 로그인 처리 원칙
 
 amux는 OAuth/브라우저 인증 과정을 자동화하지 않습니다.
 
-`amux codex login`, `amux claude login` 실행 시 브라우저 인증과 터미널 확인은 사용자가 직접 수행하고, amux는 프로필별 저장 경로 분리만 담당합니다.
+`amux login`, `amux codex login`, `amux claude login`, `amux gemini login` 실행 시 브라우저 인증과 터미널 확인은 사용자가 직접 수행하고, amux는 프로필별 저장 경로 분리만 담당합니다.
+
+Gemini CLI는 별도 `login` CLI subcommand가 아니라 `gemini` 실행 후 auth 화면에서 로그인하는 방식입니다. `amux gemini login`과 `amux login gemini`는 선택한 프로필의 `GEMINI_CLI_HOME`을 주입한 상태로 Gemini CLI를 실행합니다.
 
 ## SSH/원격 Codex 로그인
 
