@@ -863,7 +863,7 @@ async function main(): Promise<void> {
   program
     .name('amux')
     .description('amux: extensible multi-profile wrapper for AI agent CLIs')
-    .version('0.1.0');
+    .version('0.1.1');
 
   program
     .command('providers')
