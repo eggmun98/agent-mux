@@ -1,6 +1,6 @@
 {
   "name": "@eggmun/agent-mux",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "agent-mux: unofficial extensible multi-profile wrapper for AI agent CLIs",
   "license": "MIT",
   "type": "module",

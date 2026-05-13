@@ -21,8 +21,13 @@ type ProfileState = {
   providers: Record<ProviderId, ProviderProfileState>;
 };
 
+type MuxConfig = {
+  defaultProvider?: ProviderId;
+};
+
 type MuxState = {
   version: number;
+  config: MuxConfig;
   globalProfile?: ProfileName;
   sessionProfiles: Record<string, ProfileName>;
   profiles: Record<ProfileName, ProfileState>;
@@ -44,6 +49,16 @@ type ProviderStatus = {
   message?: string;
 };
 
+type ProviderStatusEntry = {
+  id: ProviderId;
+  label: string;
+  binary: string;
+  binaryPath: string | null;
+  envKey: string;
+  home: string;
+  status: ProviderStatus;
+};
+
 type LocalCallbackForwardResult = {
   statusCode: number;
   statusMessage: string;
@@ -62,13 +77,15 @@ type ProviderDefinition = {
   getStatus: (homeDir: string) => Promise<ProviderStatus>;
 };
 
-const STATE_VERSION = 3;
+const CLI_VERSION = '0.1.3';
+const STATE_VERSION = 4;
 
 const DEFAULT_AMUX_HOME = path.join(homedir(), '.amux');
 const MUX_HOME = resolveMuxHome();
 const STATE_FILE = path.join(MUX_HOME, 'state.json');
 const STATE_BACKUP_FILE = path.join(MUX_HOME, 'state.backup.json');
 const PROFILES_DIR = path.join(MUX_HOME, 'profiles');
+const PROFILES_TRASH_DIR = path.join(PROFILES_DIR, '.trash');
 
 const EXECUTABLE_CACHE = new Map<string, string | null>();
 
@@ -112,6 +129,24 @@ function normalizeSessionProfiles(input: unknown): Record<string, string> {
   }
 
   return result;
+}
+
+function normalizeConfig(input: unknown): MuxConfig {
+  const source = asObject(input);
+  if (!source) {
+    return {};
+  }
+
+  const config: MuxConfig = {};
+  const defaultProvider = source.defaultProvider;
+  if (typeof defaultProvider === 'string') {
+    const provider = findProvider(defaultProvider);
+    if (provider) {
+      config.defaultProvider = provider.id;
+    }
+  }
+
+  return config;
 }
 
 function normalizeProviderEntries(profileName: string, input: unknown): Record<string, ProviderProfileState> {
@@ -182,6 +217,7 @@ function migrateProfileState(profileName: string, input: unknown): ProfileState 
 function defaultState(): MuxState {
   return {
     version: STATE_VERSION,
+    config: {},
     sessionProfiles: {},
     profiles: {}
   };
@@ -207,6 +243,7 @@ function migrateState(input: unknown): MuxState {
 
   return {
     version: STATE_VERSION,
+    config: normalizeConfig(source.config),
     globalProfile,
     sessionProfiles: normalizeSessionProfiles(source.sessionProfiles),
     profiles
@@ -261,6 +298,44 @@ function sanitizeProfile(name: string): string {
     throw new Error('Profile name must match /^[a-zA-Z0-9_-]+$/.');
   }
   return trimmed;
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function pathIsInsideOrEqual(parent: string, target: string): boolean {
+  const relative = path.relative(path.resolve(parent), path.resolve(target));
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function rebaseProfileHomePath(home: string, fromProfile: string, toProfile: string): string {
+  const fromDir = path.join(PROFILES_DIR, fromProfile);
+  const toDir = path.join(PROFILES_DIR, toProfile);
+  if (!pathIsInsideOrEqual(fromDir, home)) {
+    return home;
+  }
+
+  return path.join(toDir, path.relative(fromDir, home));
+}
+
+function timestampForPath(): string {
+  return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+function uniquePath(basePath: string): string {
+  if (!fs.existsSync(basePath)) {
+    return basePath;
+  }
+
+  for (let index = 1; index < 1000; index += 1) {
+    const candidate = `${basePath}-${index}`;
+    if (!fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  throw new Error(`Could not allocate a unique archive path for ${basePath}.`);
 }
 
 function ensureProfile(state: MuxState, profileName: string): void {
@@ -370,6 +445,32 @@ function resolveProfile(state: MuxState, options: CommonOptions): string {
   }
 
   throw new Error('No active profile. Run `amux use <profile>` first.');
+}
+
+function resolveActiveProfileInfo(
+  state: MuxState,
+  options: CommonOptions
+): { profile?: string; from?: 'option' | 'session' | 'global'; sessionKey: string } {
+  const sessionKey = getSessionKey();
+
+  if (options.profile) {
+    const profile = sanitizeProfile(options.profile);
+    ensureProfile(state, profile);
+    return { profile, from: 'option', sessionKey };
+  }
+
+  const sessionProfile = state.sessionProfiles[sessionKey];
+  if (sessionProfile) {
+    ensureProfile(state, sessionProfile);
+    return { profile: sessionProfile, from: 'session', sessionKey };
+  }
+
+  if (state.globalProfile) {
+    ensureProfile(state, state.globalProfile);
+    return { profile: state.globalProfile, from: 'global', sessionKey };
+  }
+
+  return { sessionKey };
 }
 
 function hasActiveProfile(state: MuxState): boolean {
@@ -853,28 +954,48 @@ function findProvider(input: string): ProviderDefinition | undefined {
   });
 }
 
-function providerSelectionChoices(): SelectionChoice<ProviderDefinition>[] {
+function requireKnownProvider(input: string): ProviderDefinition {
+  const provider = findProvider(input);
+  if (!provider) {
+    throw new Error(`Unknown provider: ${input}`);
+  }
+  return provider;
+}
+
+function getDefaultProvider(state: MuxState): ProviderDefinition | undefined {
+  if (!state.config.defaultProvider) {
+    return undefined;
+  }
+
+  return PROVIDER_BY_ID.get(state.config.defaultProvider);
+}
+
+function providerSelectionChoices(defaultProvider?: ProviderDefinition): SelectionChoice<ProviderDefinition>[] {
   return PROVIDERS.map((provider) => {
     const available = findExecutable(provider.binary) !== null;
+    const details: string[] = [];
+    if (defaultProvider?.id === provider.id) {
+      details.push('default');
+    }
+    details.push(available ? provider.binary : `${provider.binary} not found`);
+
     return {
       id: provider.id,
       label: `${provider.id} (${provider.label})`,
       value: provider,
-      detail: available ? provider.binary : `${provider.binary} not found`
+      detail: details.join(', ')
     };
   });
 }
 
 async function resolveProviderForInteractiveAlias(
+  state: MuxState,
   options: CommonOptions,
   rawArgs: string[],
   emptyInputProvider: ProviderDefinition
 ): Promise<{ provider: ProviderDefinition; providerArgs: string[] }> {
   if (options.provider) {
-    const provider = findProvider(options.provider);
-    if (!provider) {
-      throw new Error(`Unknown provider: ${options.provider}`);
-    }
+    const provider = requireKnownProvider(options.provider);
     return { provider, providerArgs: rawArgs };
   }
 
@@ -896,8 +1017,9 @@ async function resolveProviderForInteractiveAlias(
     };
   }
 
-  const selected = await selectFromChoices('Select provider', providerSelectionChoices(), {
-    emptyInputValue: process.stdin.isTTY ? undefined : emptyInputProvider
+  const defaultProvider = getDefaultProvider(state);
+  const selected = await selectFromChoices('Select provider', providerSelectionChoices(defaultProvider), {
+    emptyInputValue: defaultProvider ?? (process.stdin.isTTY ? undefined : emptyInputProvider)
   });
 
   return {
@@ -958,6 +1080,169 @@ function statusToken(provider: ProviderDefinition, status: ProviderStatus): stri
   }
 
   return `${provider.id}:unknown`;
+}
+
+function statusWord(status: ProviderStatus): string {
+  if (!status.available) {
+    return 'no-cli';
+  }
+
+  if (status.loggedIn === true) {
+    return 'logged-in';
+  }
+
+  if (status.loggedIn === false) {
+    return 'logged-out';
+  }
+
+  return 'unknown';
+}
+
+function statusDetail(status: ProviderStatus): string {
+  const details: string[] = [];
+  if (status.authMethod) {
+    details.push(status.authMethod);
+  }
+  if (status.accountId) {
+    details.push(status.accountId);
+  }
+  if (status.message) {
+    details.push(status.message);
+  }
+  return details.join(' ');
+}
+
+async function collectProviderStatusEntries(state: MuxState, profile: string): Promise<ProviderStatusEntry[]> {
+  ensureProfile(state, profile);
+
+  return Promise.all(
+    PROVIDERS.map(async (provider) => {
+      const home = getProfileProviderHome(state, profile, provider.id);
+      const status = await provider.getStatus(home);
+      return {
+        id: provider.id,
+        label: provider.label,
+        binary: provider.binary,
+        binaryPath: findExecutable(provider.binary),
+        envKey: provider.envKey,
+        home,
+        status
+      };
+    })
+  );
+}
+
+function providerStatusMap(entries: ProviderStatusEntry[]): Record<string, Omit<ProviderStatusEntry, 'id'>> {
+  return Object.fromEntries(
+    entries.map((entry) => {
+      const { id, ...rest } = entry;
+      return [id, rest];
+    })
+  ) as Record<string, Omit<ProviderStatusEntry, 'id'>>;
+}
+
+function homesFromStatusEntries(entries: ProviderStatusEntry[]): Record<string, string> {
+  return Object.fromEntries(entries.map((entry) => [entry.id, entry.home])) as Record<string, string>;
+}
+
+function printProviderStatusEntries(entries: ProviderStatusEntry[], options: { verbose?: boolean } = {}): void {
+  for (const entry of entries) {
+    const executable = entry.binaryPath ?? 'not found';
+    const detail = statusDetail(entry.status);
+    const detailText = detail ? ` ${detail}` : '';
+
+    if (options.verbose) {
+      console.log(`${entry.id} ${statusWord(entry.status)} ${executable} ${entry.envKey}=${entry.home}${detailText}`);
+    } else {
+      console.log(`${entry.id} ${statusWord(entry.status)} ${executable}${detailText}`);
+    }
+  }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\"'\"'")}'`;
+}
+
+function rebaseProfileHomes(profileState: ProfileState, fromProfile: string, toProfile: string): ProfileState {
+  const next = cloneJson(profileState);
+
+  for (const entry of Object.values(next.providers)) {
+    if (typeof entry.home === 'string' && entry.home.trim()) {
+      entry.home = rebaseProfileHomePath(entry.home, fromProfile, toProfile);
+    }
+  }
+
+  ensureKnownProviderHomes(toProfile, next.providers);
+  return next;
+}
+
+function replaceProfileReferences(state: MuxState, fromProfile: string, toProfile: string): void {
+  if (state.globalProfile === fromProfile) {
+    state.globalProfile = toProfile;
+  }
+
+  for (const [sessionKey, profileName] of Object.entries(state.sessionProfiles)) {
+    if (profileName === fromProfile) {
+      state.sessionProfiles[sessionKey] = toProfile;
+    }
+  }
+}
+
+function removeProfileReferences(state: MuxState, profileName: string): void {
+  if (state.globalProfile === profileName) {
+    delete state.globalProfile;
+  }
+
+  for (const [sessionKey, selectedProfile] of Object.entries(state.sessionProfiles)) {
+    if (selectedProfile === profileName) {
+      delete state.sessionProfiles[sessionKey];
+    }
+  }
+}
+
+function renameProfileDirectory(fromProfile: string, toProfile: string): void {
+  const fromDir = path.join(PROFILES_DIR, fromProfile);
+  const toDir = path.join(PROFILES_DIR, toProfile);
+
+  if (fs.existsSync(toDir)) {
+    throw new Error(`Profile directory already exists: ${toDir}`);
+  }
+
+  if (fs.existsSync(fromDir)) {
+    ensureDir(PROFILES_DIR);
+    fs.renameSync(fromDir, toDir);
+  }
+}
+
+function copyProfileDirectory(fromProfile: string, toProfile: string): void {
+  const fromDir = path.join(PROFILES_DIR, fromProfile);
+  const toDir = path.join(PROFILES_DIR, toProfile);
+
+  if (fs.existsSync(toDir)) {
+    throw new Error(`Profile directory already exists: ${toDir}`);
+  }
+
+  if (fs.existsSync(fromDir)) {
+    fs.cpSync(fromDir, toDir, {
+      recursive: true,
+      errorOnExist: true,
+      force: false
+    });
+  } else {
+    ensureDir(toDir);
+  }
+}
+
+function archiveProfileDirectory(profileName: string): string | undefined {
+  const profileDir = path.join(PROFILES_DIR, profileName);
+  if (!fs.existsSync(profileDir)) {
+    return undefined;
+  }
+
+  ensureDir(PROFILES_TRASH_DIR);
+  const archivePath = uniquePath(path.join(PROFILES_TRASH_DIR, `${profileName}-${timestampForPath()}`));
+  fs.renameSync(profileDir, archivePath);
+  return archivePath;
 }
 
 function printJson(value: unknown): void {
@@ -1036,6 +1321,9 @@ function registerProviderCommands(
       const status = await provider.getStatus(home);
 
       if (options.json) {
+        if (!status.available) {
+          process.exitCode = 1;
+        }
         printJson({
           provider: provider.id,
           profile,
@@ -1123,7 +1411,7 @@ async function main(): Promise<void> {
   program
     .name('amux')
     .description('amux: extensible multi-profile wrapper for AI agent CLIs')
-    .version('0.1.2');
+    .version(CLI_VERSION);
 
   program
     .command('providers')
@@ -1308,6 +1596,375 @@ async function main(): Promise<void> {
       }
     });
 
+  program
+    .command('status')
+    .description('show all provider auth status for selected profile')
+    .addOption(commonProfileOption)
+    .addOption(new Option('--json', 'output as JSON'))
+    .addOption(commonVerboseOption)
+    .action(async (options: CommonOptions) => {
+      const state = readState();
+      const active = resolveActiveProfileInfo(state, options);
+      if (!active.profile) {
+        throw new Error('No active profile. Run `amux use <profile>` first.');
+      }
+
+      const entries = await collectProviderStatusEntries(state, active.profile);
+      writeState(state);
+
+      if (options.json) {
+        const homes = homesFromStatusEntries(entries);
+        if (entries.some((entry) => !entry.status.available)) {
+          process.exitCode = 1;
+        }
+        printJson({
+          profile: active.profile,
+          from: active.from,
+          sessionKey: active.sessionKey,
+          homes,
+          ...providerHomeLegacyFields(homes),
+          providers: providerStatusMap(entries)
+        });
+        return;
+      }
+
+      console.log(`profile=${active.profile}`);
+      printProviderStatusEntries(entries, { verbose: options.verbose });
+
+      if (entries.some((entry) => !entry.status.available)) {
+        process.exitCode = 1;
+      }
+    });
+
+  program
+    .command('doctor')
+    .description('diagnose amux, profile, provider CLI, and auth state')
+    .addOption(commonProfileOption)
+    .addOption(new Option('--json', 'output as JSON'))
+    .addOption(commonVerboseOption)
+    .action(async (options: CommonOptions) => {
+      const state = readState();
+      const active = resolveActiveProfileInfo(state, options);
+      const defaultProvider = getDefaultProvider(state);
+      const issues: string[] = [];
+      let entries: ProviderStatusEntry[] = [];
+
+      if (active.profile) {
+        entries = await collectProviderStatusEntries(state, active.profile);
+        for (const entry of entries) {
+          if (!entry.status.available) {
+            issues.push(`${entry.id}: ${entry.binary} not found in PATH`);
+          }
+        }
+        writeState(state);
+      } else {
+        for (const provider of PROVIDERS) {
+          if (!findExecutable(provider.binary)) {
+            issues.push(`${provider.id}: ${provider.binary} not found in PATH`);
+          }
+        }
+        issues.push('No active profile. Run `amux use <profile>` first.');
+      }
+
+      if (state.config.defaultProvider && !defaultProvider) {
+        issues.push(`Configured default provider is unknown: ${state.config.defaultProvider}`);
+      }
+
+      if (options.json) {
+        const homes = active.profile ? homesFromStatusEntries(entries) : {};
+        if (issues.length > 0) {
+          process.exitCode = 1;
+        }
+        printJson({
+          ok: issues.length === 0,
+          version: CLI_VERSION,
+          amuxHome: MUX_HOME,
+          stateFile: STATE_FILE,
+          sessionKey: active.sessionKey,
+          profile: active.profile,
+          profileFrom: active.from,
+          defaultProvider: defaultProvider?.id,
+          profileCount: Object.keys(state.profiles).length,
+          homes,
+          providers: active.profile ? providerStatusMap(entries) : undefined,
+          issues
+        });
+        return;
+      }
+
+      console.log(`amux=${CLI_VERSION}`);
+      console.log(`home=${MUX_HOME}`);
+      console.log(`state=${STATE_FILE}`);
+      console.log(`session=${active.sessionKey}`);
+      console.log(`profile=${active.profile ? `${active.profile} (${active.from})` : 'none'}`);
+      console.log(`default-provider=${defaultProvider?.id ?? 'unset'}`);
+
+      if (active.profile) {
+        console.log('providers:');
+        printProviderStatusEntries(entries, { verbose: true });
+      } else {
+        console.log('providers:');
+        for (const provider of PROVIDERS) {
+          const executable = findExecutable(provider.binary) ?? 'not found';
+          console.log(`${provider.id} ${executable}`);
+        }
+      }
+
+      if (issues.length > 0) {
+        console.log('issues:');
+        for (const issue of issues) {
+          console.log(`- ${issue}`);
+        }
+        process.exitCode = 1;
+      } else if (options.verbose) {
+        console.log('issues: none');
+      }
+    });
+
+  program
+    .command('env [provider]')
+    .description('print shell exports for selected profile provider homes')
+    .addOption(commonProfileOption)
+    .addOption(new Option('--json', 'output as JSON'))
+    .action((providerArg: string | undefined, options: CommonOptions) => {
+      const state = readState();
+      const profile = resolveProfile(state, options);
+      const selectedProviders = providerArg ? [requireKnownProvider(providerArg)] : PROVIDERS;
+      const envValues: Record<string, string> = {};
+
+      for (const provider of selectedProviders) {
+        envValues[provider.envKey] = getProfileProviderHome(state, profile, provider.id);
+      }
+
+      writeState(state);
+
+      if (options.json) {
+        printJson({
+          profile,
+          env: envValues
+        });
+        return;
+      }
+
+      for (const [key, value] of Object.entries(envValues)) {
+        console.log(`export ${key}=${shellQuote(value)}`);
+      }
+    });
+
+  const profileCmd = program.command('profile').description('manage amux profiles');
+
+  profileCmd
+    .command('list')
+    .description('list profile names without checking provider auth status')
+    .addOption(new Option('--json', 'output as JSON'))
+    .action((options: CommonOptions) => {
+      const state = readState();
+      const sessionKey = getSessionKey();
+      const profiles = Object.keys(state.profiles)
+        .sort()
+        .map((profile) => ({
+          profile,
+          sessionActive: state.sessionProfiles[sessionKey] === profile,
+          globalDefault: state.globalProfile === profile
+        }));
+
+      if (options.json) {
+        printJson({
+          sessionKey,
+          globalProfile: state.globalProfile,
+          profiles
+        });
+        return;
+      }
+
+      if (profiles.length === 0) {
+        console.log('No profiles yet. Run `amux use <profile>` first.');
+        return;
+      }
+
+      for (const row of profiles) {
+        const tags: string[] = [];
+        if (row.sessionActive) {
+          tags.push('session');
+        }
+        if (row.globalDefault) {
+          tags.push('global');
+        }
+        console.log(`${row.profile}${tags.length > 0 ? ` [${tags.join(',')}]` : ''}`);
+      }
+    });
+
+  profileCmd
+    .command('rename <from> <to>')
+    .description('rename a profile and move its profile directory')
+    .addOption(new Option('--json', 'output as JSON'))
+    .action((fromArg: string, toArg: string, options: CommonOptions) => {
+      const fromProfile = sanitizeProfile(fromArg);
+      const toProfile = sanitizeProfile(toArg);
+      const state = readState();
+
+      if (!state.profiles[fromProfile]) {
+        throw new Error(`Profile not found: ${fromProfile}`);
+      }
+      if (state.profiles[toProfile]) {
+        throw new Error(`Profile already exists: ${toProfile}`);
+      }
+
+      ensureProfile(state, fromProfile);
+      renameProfileDirectory(fromProfile, toProfile);
+      state.profiles[toProfile] = rebaseProfileHomes(state.profiles[fromProfile], fromProfile, toProfile);
+      delete state.profiles[fromProfile];
+      replaceProfileReferences(state, fromProfile, toProfile);
+      writeState(state);
+
+      if (options.json) {
+        printJson({ ok: true, from: fromProfile, to: toProfile });
+        return;
+      }
+
+      console.log(`${fromProfile} -> ${toProfile}`);
+    });
+
+  profileCmd
+    .command('copy <from> <to>')
+    .description('copy a profile and its profile directory')
+    .addOption(new Option('--json', 'output as JSON'))
+    .action((fromArg: string, toArg: string, options: CommonOptions) => {
+      const fromProfile = sanitizeProfile(fromArg);
+      const toProfile = sanitizeProfile(toArg);
+      const state = readState();
+
+      if (!state.profiles[fromProfile]) {
+        throw new Error(`Profile not found: ${fromProfile}`);
+      }
+      if (state.profiles[toProfile]) {
+        throw new Error(`Profile already exists: ${toProfile}`);
+      }
+
+      ensureProfile(state, fromProfile);
+      copyProfileDirectory(fromProfile, toProfile);
+      state.profiles[toProfile] = rebaseProfileHomes(state.profiles[fromProfile], fromProfile, toProfile);
+      writeState(state);
+
+      if (options.json) {
+        printJson({ ok: true, from: fromProfile, to: toProfile });
+        return;
+      }
+
+      console.log(`${fromProfile} copied to ${toProfile}`);
+    });
+
+  profileCmd
+    .command('remove <profile>')
+    .description('remove a profile from state and archive its profile directory')
+    .addOption(new Option('--json', 'output as JSON'))
+    .action((profileArg: string, options: CommonOptions) => {
+      const profile = sanitizeProfile(profileArg);
+      const state = readState();
+
+      if (!state.profiles[profile]) {
+        throw new Error(`Profile not found: ${profile}`);
+      }
+
+      const archivePath = archiveProfileDirectory(profile);
+      delete state.profiles[profile];
+      removeProfileReferences(state, profile);
+      writeState(state);
+
+      if (options.json) {
+        printJson({
+          ok: true,
+          profile,
+          archivedTo: archivePath
+        });
+        return;
+      }
+
+      console.log(`${profile} removed${archivePath ? ` archived=${archivePath}` : ''}`);
+    });
+
+  const configCmd = program.command('config').description('manage amux settings');
+
+  configCmd
+    .command('list')
+    .description('list configured settings')
+    .addOption(new Option('--json', 'output as JSON'))
+    .action((options: CommonOptions) => {
+      const state = readState();
+      const defaultProvider = getDefaultProvider(state);
+
+      if (options.json) {
+        printJson({
+          defaultProvider: defaultProvider?.id
+        });
+        return;
+      }
+
+      console.log(`default-provider=${defaultProvider?.id ?? 'unset'}`);
+    });
+
+  configCmd
+    .command('get <key>')
+    .description('get a configured setting')
+    .addOption(new Option('--json', 'output as JSON'))
+    .action((key: string, options: CommonOptions) => {
+      const state = readState();
+      if (key !== 'default-provider') {
+        throw new Error(`Unknown config key: ${key}`);
+      }
+
+      const value = getDefaultProvider(state)?.id;
+      if (options.json) {
+        printJson({ key, value });
+        return;
+      }
+
+      console.log(value ?? 'unset');
+    });
+
+  configCmd
+    .command('set <key> <value>')
+    .description('set a configured setting')
+    .addOption(new Option('--json', 'output as JSON'))
+    .action((key: string, value: string, options: CommonOptions) => {
+      const state = readState();
+      if (key !== 'default-provider') {
+        throw new Error(`Unknown config key: ${key}`);
+      }
+
+      const provider = requireKnownProvider(value);
+      state.config.defaultProvider = provider.id;
+      writeState(state);
+
+      if (options.json) {
+        printJson({ ok: true, key, value: provider.id });
+        return;
+      }
+
+      console.log(`${key}=${provider.id}`);
+    });
+
+  configCmd
+    .command('unset <key>')
+    .description('unset a configured setting')
+    .addOption(new Option('--json', 'output as JSON'))
+    .action((key: string, options: CommonOptions) => {
+      const state = readState();
+      if (key !== 'default-provider') {
+        throw new Error(`Unknown config key: ${key}`);
+      }
+
+      delete state.config.defaultProvider;
+      writeState(state);
+
+      if (options.json) {
+        printJson({ ok: true, key });
+        return;
+      }
+
+      console.log(`${key}=unset`);
+    });
+
   for (const provider of PROVIDERS) {
     registerProviderCommands(program, provider, commonProfileOption, commonVerboseOption);
   }
@@ -1327,8 +1984,8 @@ async function main(): Promise<void> {
     .addOption(commonVerboseOption)
     .argument('[providerOrArgs...]', 'optional provider id + args forwarded to provider login')
     .action(async (providerOrArgs: string[], options: CommonOptions) => {
-      const selected = await resolveProviderForInteractiveAlias(options, providerOrArgs, codexProvider);
       const state = readState();
+      const selected = await resolveProviderForInteractiveAlias(state, options, providerOrArgs, codexProvider);
       const profile = resolveProfile(state, options);
       writeState(state);
       const exitCode = await runProviderWithProfile(
